@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:mqtt_client/mqtt_client.dart';
@@ -1747,7 +1748,7 @@ class _ControllerPageState extends State<ControllerPage> {
             _drawerSectionTitle("Developer"),
             ListTile(
               leading: Icon(Icons.code_rounded, color: AppColors.textFaint(isDark)),
-              title: Text("Vladimir Putin", style: TextStyle(color: AppColors.text(isDark), fontWeight: FontWeight.w700)),
+              title: Text("NEXUS DEV", style: TextStyle(color: AppColors.text(isDark), fontWeight: FontWeight.w700)),
               subtitle: Text("Developer aplikasi & firmware", style: TextStyle(color: AppColors.textFaint(isDark), fontSize: 11)),
             ),
             ListTile(
