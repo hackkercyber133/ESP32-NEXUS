@@ -959,7 +959,30 @@ class _ControllerPageState extends State<ControllerPage> {
   }
 
   void _showSnack(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    if (!mounted) return;
+    final isWarning = text.contains('⚠️');
+    final isError = text.contains('❌');
+    final isSuccess = text.contains('✅');
+    final color = isWarning
+        ? Colors.amberAccent
+        : isError
+            ? Colors.redAccent
+            : isSuccess
+                ? Colors.greenAccent
+                : accentColor;
+    final icon = isWarning
+        ? Icons.warning_amber_rounded
+        : isError
+            ? Icons.error_rounded
+            : isSuccess
+                ? Icons.check_circle_rounded
+                : Icons.info_rounded;
+    final overlay = Overlay.of(context);
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (_) => _GamingToast(text: text, color: color, icon: icon, onDone: () => entry.remove()),
+    );
+    overlay.insert(entry);
   }
 
   Future<void> _openLink(String url) async {
@@ -1826,7 +1849,7 @@ class _ControllerPageState extends State<ControllerPage> {
           ),
           const SizedBox(width: 10),
           Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('ESP32 NEXUS', style: TextStyle(color: AppColors.text(isDark), fontSize: 16, fontWeight: FontWeight.w900, letterSpacing: 1.0)),
+            const _ShimmerTitle(text: 'VLADIMIR PUTIN'),
             Text('GAMING CONTROL • 2026', style: TextStyle(color: AppColors.textFaint(isDark), fontSize: 8, letterSpacing: 1.4)),
           ]),
         ]),
@@ -1896,24 +1919,40 @@ class _ControllerPageState extends State<ControllerPage> {
       ),
       // Marquee berjalan terus ke kiri & muncul lagi dari kanan (looping),
       // bukan Row statis lagi -> lihat class _RunningMarquee di bawah.
+      // Jarak antar item dibuat SERAGAM (pakai SizedBox, bukan padding per-item)
+      // supaya gerakannya terasa mulus dan tidak ada teks yang terkesan "loncat".
       child: _RunningMarquee(
         speedPxPerSecond: 40,
-        gap: 28,
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          _tickerChip('5V', 'ECO', Colors.greenAccent),
-          _tickerChip('9V', 'BOOST', Colors.amberAccent),
-          _tickerChip('12V', 'TURBO', Colors.purpleAccent),
-          _tickerChip('15V', 'OVERDRIVE', Colors.redAccent),
-          Padding(padding: const EdgeInsets.symmetric(horizontal: 12), child: Text('NEXUS CONTROL CORE', style: TextStyle(color: accentColor, fontSize: 9, fontWeight: FontWeight.w900, letterSpacing: 1.5))),
-        ]),
+        gap: 26,
+        child: _tickerRow(),
       ),
     );
   }
 
-  Widget _tickerChip(String v, String label, Color c) => Padding(
-    padding: const EdgeInsets.only(left: 12),
-    child: Text('• $v $label', style: TextStyle(color: c, fontSize: 9, fontWeight: FontWeight.w900, letterSpacing: 1)),
-  );
+  Widget _tickerRow() {
+    const itemGap = 26.0;
+    final items = <Widget>[
+      _tickerChip('5V', 'ECO', Colors.greenAccent),
+      _tickerChip('9V', 'BOOST', Colors.amberAccent),
+      _tickerChip('12V', 'TURBO', Colors.purpleAccent),
+      _tickerChip('15V', 'OVERDRIVE', Colors.redAccent),
+      _tickerName('VLADIMIR PUTIN'),
+      _tickerName('FERN'),
+      _tickerName('CHODOX'),
+    ];
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      for (int i = 0; i < items.length; i++) ...[
+        items[i],
+        if (i != items.length - 1) const SizedBox(width: itemGap),
+      ],
+    ]);
+  }
+
+  Widget _tickerChip(String v, String label, Color c) =>
+      Text('• $v $label', style: TextStyle(color: c, fontSize: 9, fontWeight: FontWeight.w900, letterSpacing: 1));
+
+  Widget _tickerName(String name) =>
+      Text(name, style: TextStyle(color: accentColor, fontSize: 9, fontWeight: FontWeight.w900, letterSpacing: 1.5));
 
   Widget _nexusDeviceCard(bool isDark, bool online) {
     return _nexusCard(isDark, child: Row(children: [
@@ -1974,10 +2013,11 @@ class _ControllerPageState extends State<ControllerPage> {
         crossAxisSpacing: 10, mainAxisSpacing: 10, childAspectRatio: 1.45,
         children: modes.map((m) {
           final double v = m['v']; final Color c = m['c']; final selected = setVolt == v;
-          return GestureDetector(
+          return _TapScale(
             onTap: () => sendVoltage(v),
             child: AnimatedContainer(
-              duration: const Duration(milliseconds: 220),
+              duration: const Duration(milliseconds: 260),
+              curve: Curves.easeOutCubic,
               padding: const EdgeInsets.all(15),
               decoration: BoxDecoration(
                 color: selected ? c.withOpacity(.13) : AppColors.card(isDark),
@@ -2034,10 +2074,11 @@ class _ControllerPageState extends State<ControllerPage> {
 
   Widget _rgbButton(bool isDark, String label, String mode, IconData icon) {
     final selected = ledMode == mode;
-    return Expanded(child: GestureDetector(
+    return Expanded(child: _TapScale(
       onTap: () => sendLed(mode),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
         margin: const EdgeInsets.symmetric(horizontal: 2), padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
         decoration: BoxDecoration(color: selected ? accentColor.withOpacity(.16) : AppColors.card(isDark), borderRadius: BorderRadius.circular(12), border: Border.all(color: selected ? accentColor : Colors.transparent)),
         child: Column(children: [Icon(icon, color: selected ? accentColor : AppColors.textFaint(isDark), size: 16), const SizedBox(height: 4), Text(label, style: TextStyle(color: selected ? accentColor : AppColors.textFaint(isDark), fontSize: 7, fontWeight: FontWeight.w900))]),
@@ -2057,7 +2098,7 @@ class _ControllerPageState extends State<ControllerPage> {
     _quickTile(isDark, Icons.palette_outlined, 'THEME', () => _showThemeSheet()),
   ]);
 
-  Widget _quickTile(bool isDark, IconData icon, String label, VoidCallback onTap) => Expanded(child: GestureDetector(
+  Widget _quickTile(bool isDark, IconData icon, String label, VoidCallback onTap) => Expanded(child: _TapScale(
     onTap: onTap,
     child: _nexusCard(isDark, child: Column(children: [Icon(icon, color: accentColor, size: 22), const SizedBox(height: 7), Text(label, style: TextStyle(color: AppColors.text(isDark), fontSize: 8, fontWeight: FontWeight.w900, letterSpacing: 1))])),
   ));
@@ -2131,6 +2172,191 @@ class _NexusGridPainter extends CustomPainter {
   }
   @override
   bool shouldRepaint(covariant _NexusGridPainter oldDelegate) => oldDelegate.color != color;
+}
+
+// ===== SHIMMER TITLE: teks dengan kilau warna gaming yang bergerak =====
+// ===== bolak-balik ke kanan & kiri, seperti pantulan cahaya berjalan. =====
+class _ShimmerTitle extends StatefulWidget {
+  final String text;
+  const _ShimmerTitle({required this.text});
+
+  @override
+  State<_ShimmerTitle> createState() => _ShimmerTitleState();
+}
+
+class _ShimmerTitleState extends State<_ShimmerTitle> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+
+  static const _colors = [
+    Color(0xFF00F5FF), // cyan
+    Color(0xFFB026FF), // purple
+    Color(0xFFFF2ED1), // pink
+    Color(0xFF3AF7A0), // green
+    Color(0xFF00F5FF), // balik ke cyan supaya loop mulus
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 2600))
+      ..repeat(reverse: true); // bolak-balik kanan <-> kiri, bukan cuma satu arah
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (_, child) {
+        // sweep bergerak dari kiri ke kanan lalu kembali (efek pantulan cahaya)
+        final sweep = _ctrl.value; // 0..1..0 karena reverse:true
+        return ShaderMask(
+          blendMode: BlendMode.srcIn,
+          shaderCallback: (bounds) {
+            return LinearGradient(
+              colors: _colors,
+              begin: Alignment(-1.6 + sweep * 3.2, 0),
+              end: Alignment(-0.6 + sweep * 3.2, 0),
+              tileMode: TileMode.mirror,
+            ).createShader(bounds);
+          },
+          child: child,
+        );
+      },
+      child: Text(
+        widget.text,
+        style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w900, letterSpacing: 1.2),
+      ),
+    );
+  }
+}
+
+// ===== TAP SCALE: efek "ditekan" yang halus (scale down lalu spring back) =====
+// ===== dipakai di tombol-tombol utama supaya interaksi terasa lebih smooth. =====
+class _TapScale extends StatefulWidget {
+  final Widget child;
+  final VoidCallback? onTap;
+  const _TapScale({required this.child, this.onTap});
+
+  @override
+  State<_TapScale> createState() => _TapScaleState();
+}
+
+class _TapScaleState extends State<_TapScale> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 160));
+  late final Animation<double> _scale = Tween<double>(begin: 1.0, end: 0.94)
+      .animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOutCubic));
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTap,
+      onTapDown: (_) => _ctrl.forward(),
+      onTapUp: (_) => _ctrl.reverse(),
+      onTapCancel: () => _ctrl.reverse(),
+      child: AnimatedBuilder(
+        animation: _scale,
+        builder: (_, child) => Transform.scale(scale: _scale.value, child: child),
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+// ===== TOAST GAYA GAMING: muncul dari bawah layar dengan halus, =====
+// ===== lalu pelan-pelan menghilang (fade out), dipakai oleh _showSnack. =====
+class _GamingToast extends StatefulWidget {
+  final String text;
+  final Color color;
+  final IconData icon;
+  final VoidCallback onDone;
+  const _GamingToast({required this.text, required this.color, required this.icon, required this.onDone});
+
+  @override
+  State<_GamingToast> createState() => _GamingToastState();
+}
+
+class _GamingToastState extends State<_GamingToast> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<Offset> _slide;
+  late final Animation<double> _fade;
+
+  static const _inMs = 420;
+  static const _holdMs = 2000;
+  static const _outMs = 900;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: _inMs + _holdMs + _outMs));
+    _slide = TweenSequence<Offset>([
+      TweenSequenceItem(tween: Tween(begin: const Offset(0, 1.4), end: Offset.zero).chain(CurveTween(curve: Curves.easeOutCubic)), weight: _inMs.toDouble()),
+      TweenSequenceItem(tween: ConstantTween(Offset.zero), weight: (_holdMs + _outMs).toDouble()),
+    ]).animate(_ctrl);
+    _fade = TweenSequence<double>([
+      TweenSequenceItem(tween: Tween(begin: 0.0, end: 1.0).chain(CurveTween(curve: Curves.easeOut)), weight: _inMs.toDouble()),
+      TweenSequenceItem(tween: ConstantTween(1.0), weight: _holdMs.toDouble()),
+      TweenSequenceItem(tween: Tween(begin: 1.0, end: 0.0).chain(CurveTween(curve: Curves.easeInCubic)), weight: _outMs.toDouble()),
+    ]).animate(_ctrl);
+    _ctrl.forward().whenComplete(() {
+      if (mounted) widget.onDone();
+    });
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      left: 16,
+      right: 16,
+      bottom: 24,
+      child: SafeArea(
+        top: false,
+        child: SlideTransition(
+          position: _slide,
+          child: FadeTransition(
+            opacity: _fade,
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0B1220).withOpacity(.96),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: widget.color.withOpacity(.55), width: 1.3),
+                  boxShadow: [
+                    BoxShadow(color: widget.color.withOpacity(.35), blurRadius: 22, spreadRadius: 1),
+                  ],
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(widget.icon, color: widget.color, size: 19),
+                  const SizedBox(width: 10),
+                  Flexible(child: Text(widget.text, style: TextStyle(color: Colors.white, fontSize: 12.5, fontWeight: FontWeight.w700))),
+                ]),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // ===== MARQUEE: teks/konten berjalan terus-menerus ke kiri, muncul lagi =====
