@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'dart:async';
@@ -960,6 +961,16 @@ class _ControllerPageState extends State<ControllerPage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
+  Future<void> _openLink(String url) async {
+    final uri = Uri.parse(url);
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) _showSnack("⚠️ Tidak bisa membuka link: $url");
+    } catch (e) {
+      _showSnack("⚠️ Tidak bisa membuka link: $url");
+    }
+  }
+
   // ===== EXPORT / IMPORT KONFIGURASI =====
   void _showBackupDialog() {
     showDialog(
@@ -1254,10 +1265,8 @@ class _ControllerPageState extends State<ControllerPage> {
                 Divider(color: Colors.white24, height: 20),
                 Text("Developer", style: TextStyle(color: accentColor, fontWeight: FontWeight.bold)),
                 SizedBox(height: 4),
-                Text("Nama: Apri Ansyah"),
-                Text("Telegram Dev: t.me/bujanginm"),
-                Text("Group Telegram:"),
-                Text("https://t.me/forumdiskusitele/371474"),
+                Text("Nama: M.ADY AFRIANSYAH"),
+                Text("Support: ChoDox & FerN"),
                 Divider(color: Colors.white24, height: 20),
                 Text("Tujuan Aplikasi", style: TextStyle(color: accentColor, fontWeight: FontWeight.bold)),
                 SizedBox(height: 4),
@@ -1738,18 +1747,22 @@ class _ControllerPageState extends State<ControllerPage> {
             _drawerSectionTitle("Developer"),
             ListTile(
               leading: Icon(Icons.code_rounded, color: AppColors.textFaint(isDark)),
-              title: Text("NEXUS DEV", style: TextStyle(color: AppColors.text(isDark), fontWeight: FontWeight.w700)),
+              title: Text("Vladimir Putin", style: TextStyle(color: AppColors.text(isDark), fontWeight: FontWeight.w700)),
               subtitle: Text("Developer aplikasi & firmware", style: TextStyle(color: AppColors.textFaint(isDark), fontSize: 11)),
             ),
             ListTile(
               leading: Icon(Icons.send_rounded, color: AppColors.textFaint(isDark)),
               title: Text("Telegram Developer", style: TextStyle(color: AppColors.text(isDark))),
-              subtitle: Text("@your_username", style: TextStyle(color: accentColor, fontSize: 11)),
+              subtitle: Text("t.me/bujanginm", style: TextStyle(color: accentColor, fontSize: 11)),
+              trailing: Icon(Icons.open_in_new_rounded, size: 16, color: AppColors.textFaint(isDark)),
+              onTap: () => _openLink("https://t.me/bujanginm"),
             ),
             ListTile(
               leading: Icon(Icons.groups_rounded, color: AppColors.textFaint(isDark)),
               title: Text("Group Developer", style: TextStyle(color: AppColors.text(isDark))),
-              subtitle: Text("@your_group", style: TextStyle(color: accentColor, fontSize: 11)),
+              subtitle: Text("t.me/forumdiskusitele", style: TextStyle(color: accentColor, fontSize: 11)),
+              trailing: Icon(Icons.open_in_new_rounded, size: 16, color: AppColors.textFaint(isDark)),
+              onTap: () => _openLink("https://t.me/forumdiskusitele"),
             ),
             ListTile(
               leading: Icon(Icons.info_outline_rounded, color: AppColors.textFaint(isDark)),
@@ -1880,10 +1893,12 @@ class _ControllerPageState extends State<ControllerPage> {
         borderRadius: BorderRadius.circular(13),
         border: Border.all(color: accentColor.withOpacity(.18)),
       ),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        physics: const NeverScrollableScrollPhysics(),
-        child: Row(children: [
+      // Marquee berjalan terus ke kiri & muncul lagi dari kanan (looping),
+      // bukan Row statis lagi -> lihat class _RunningMarquee di bawah.
+      child: _RunningMarquee(
+        speedPxPerSecond: 40,
+        gap: 28,
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
           _tickerChip('5V', 'ECO', Colors.greenAccent),
           _tickerChip('9V', 'BOOST', Colors.amberAccent),
           _tickerChip('12V', 'TURBO', Colors.purpleAccent),
@@ -2115,4 +2130,84 @@ class _NexusGridPainter extends CustomPainter {
   }
   @override
   bool shouldRepaint(covariant _NexusGridPainter oldDelegate) => oldDelegate.color != color;
+}
+
+// ===== MARQUEE: teks/konten berjalan terus-menerus ke kiri, muncul lagi =====
+// ===== dari kanan (looping), dipakai oleh _nexusTicker di atas. =====
+class _RunningMarquee extends StatefulWidget {
+  final Widget child;
+  final double speedPxPerSecond;
+  final double gap;
+  const _RunningMarquee({required this.child, this.speedPxPerSecond = 40, this.gap = 24});
+
+  @override
+  State<_RunningMarquee> createState() => _RunningMarqueeState();
+}
+
+class _RunningMarqueeState extends State<_RunningMarquee> with SingleTickerProviderStateMixin {
+  late final Ticker _ticker;
+  Duration _lastElapsed = Duration.zero;
+  double _offset = 0;
+  double _contentWidth = 0;
+  bool _measured = false;
+  final GlobalKey _measureKey = GlobalKey();
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker(_onTick)..start();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
+  }
+
+  void _measure() {
+    final box = _measureKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box != null && mounted) {
+      setState(() {
+        _contentWidth = box.size.width;
+        _measured = true;
+      });
+    }
+  }
+
+  void _onTick(Duration elapsed) {
+    if (!_measured || _contentWidth <= 0) {
+      _lastElapsed = elapsed;
+      return;
+    }
+    final dt = (elapsed - _lastElapsed).inMicroseconds / 1000000.0;
+    _lastElapsed = elapsed;
+    final loopWidth = _contentWidth + widget.gap;
+    double next = _offset - (widget.speedPxPerSecond * dt);
+    if (next <= -loopWidth) next += loopWidth;
+    setState(() => _offset = next);
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_measured) {
+      // Lewat sekali secara transparan cuma untuk mengukur lebar konten
+      // sebelum animasi berjalan sungguhan.
+      return Opacity(
+        opacity: 0,
+        child: Container(key: _measureKey, child: widget.child),
+      );
+    }
+    return ClipRect(
+      child: Transform.translate(
+        offset: Offset(_offset, 0),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          widget.child,
+          SizedBox(width: widget.gap),
+          widget.child, // salinan kedua -> transisi loop terlihat nyambung/mulus
+          SizedBox(width: widget.gap),
+        ]),
+      ),
+    );
+  }
 }
