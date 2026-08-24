@@ -760,11 +760,12 @@ class _ControllerPageState extends State<ControllerPage> {
   }
 
   // ===== BLUETOOTH =====
-  void scanBLE() async {
+  void scanBLE({VoidCallback? onUpdate}) async {
     setState(() {
       isScanning = true;
       scanResults.clear();
     });
+    onUpdate?.call();
     FlutterBluePlus.startScan(timeout: Duration(seconds: 5));
     FlutterBluePlus.onScanResults.listen((results) {
       setState(() {
@@ -773,11 +774,13 @@ class _ControllerPageState extends State<ControllerPage> {
         scanResults =
             results.where((r) => r.device.platformName.contains("ESP32-Cooler-")).toList();
       });
+      onUpdate?.call();
     });
     await Future.delayed(Duration(seconds: 6));
     setState(() {
       isScanning = false;
     });
+    onUpdate?.call();
   }
 
   // Ambil ID unik cooler dari nama BLE-nya, mis. "ESP32-Cooler-A1B2C3" -> "A1B2C3"
@@ -1359,11 +1362,25 @@ class _ControllerPageState extends State<ControllerPage> {
     final nicknameController = TextEditingController();
     final manualIdController = TextEditingController();
     int tab = 0; // 0 = Bluetooth, 1 = Manual (WiFi)
-    scanBLE();
+    bool scanStarted = false;
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) {
+          if (!scanStarted) {
+            scanStarted = true;
+            // Baru mulai scan setelah dialog ini benar-benar terbentuk, supaya
+            // update hasil scan (lewat onUpdate di bawah) bisa memicu
+            // setDialogState -> dialog ikut rebuild. Kalau scan dimulai
+            // sebelum showDialog (seperti sebelumnya), hasil scan yang masuk
+            // belakangan hanya me-rebuild widget utama, bukan dialog ini,
+            // sehingga dialog macet selamanya di "Mencari cooler di sekitar...".
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              scanBLE(onUpdate: () {
+                if (ctx.mounted) setDialogState(() {});
+              });
+            });
+          }
           return AlertDialog(
             backgroundColor: Color(0xFF11161f),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -1440,7 +1457,9 @@ class _ControllerPageState extends State<ControllerPage> {
                         );
                       }).toList(),
                       TextButton.icon(
-                        onPressed: () => setDialogState(() => scanBLE()),
+                        onPressed: () => scanBLE(onUpdate: () {
+                          if (ctx.mounted) setDialogState(() {});
+                        }),
                         icon: Icon(Icons.refresh, color: accentColor, size: 18),
                         label: Text("Scan ulang", style: TextStyle(color: accentColor)),
                       ),
