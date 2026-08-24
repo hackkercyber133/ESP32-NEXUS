@@ -2,13 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:http/http.dart' as http;
-import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_server_client.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'theme_controller.dart';
 import 'history_service.dart';
@@ -27,19 +26,21 @@ import 'schedule_page.dart';
 class Cooler {
   String id; // deviceId unik dari firmware, mis. "A1B2C3"
   String nickname; // nama custom dari user, mis. "Cooler Kamar"
-  String mode; // "WiFi" (MQTT) atau "Bluetooth" (BLE)
+  String mode; // "WiFi" (HTTP lokal) atau "Bluetooth" (BLE)
   String? bleRemoteId; // MAC BLE, hanya diisi kalau mode == Bluetooth
+  String? lastIp; // IP terakhir yang diketahui di jaringan lokal, hanya kalau mode == WiFi
 
-  Cooler({required this.id, required this.nickname, required this.mode, this.bleRemoteId});
+  Cooler({required this.id, required this.nickname, required this.mode, this.bleRemoteId, this.lastIp});
 
   Map<String, dynamic> toJson() =>
-      {"id": id, "nickname": nickname, "mode": mode, "bleRemoteId": bleRemoteId};
+      {"id": id, "nickname": nickname, "mode": mode, "bleRemoteId": bleRemoteId, "lastIp": lastIp};
 
   factory Cooler.fromJson(Map<String, dynamic> j) => Cooler(
         id: j["id"],
         nickname: j["nickname"],
         mode: j["mode"],
         bleRemoteId: j["bleRemoteId"],
+        lastIp: j["lastIp"],
       );
 }
 
@@ -469,13 +470,11 @@ class _ControllerPageState extends State<ControllerPage> {
     Colors.lightGreenAccent,
   ];
 
-  // ===== MQTT =====
-  MqttServerClient? mqttClient;
-  final String broker = "broker.emqx.io";
-  // Topic sekarang per-cooler (pakai deviceId), BUKAN global lagi.
-  // Ini kunci supaya HP A tidak bisa mengontrol Cooler B secara tidak sengaja.
-  String get cmdTopic => "cooler/${activeCooler?.id}/command";
-  String get statusTopic => "cooler/${activeCooler?.id}/status";
+  // ===== WIFI LOKAL (kontrol langsung ke ESP32 di jaringan yang sama, TANPA broker/internet) =====
+  String? _wifiIp; // IP ESP32 aktif, ditemukan otomatis lewat beacon UDP dari firmware
+  RawDatagramSocket? _udpDiscoverySocket;
+  Timer? _wifiPollTimer;
+  static const int kUdpBeaconPort = 47269;
 
   // ===== BLUETOOTH =====
   BluetoothDevice? bleDevice;
@@ -516,7 +515,8 @@ class _ControllerPageState extends State<ControllerPage> {
   void dispose() {
     _scheduleTimer?.cancel();
     _offlineCheckTimer?.cancel();
-    mqttClient?.disconnect();
+    _wifiPollTimer?.cancel();
+    _udpDiscoverySocket?.close();
     super.dispose();
   }
 
@@ -619,7 +619,7 @@ class _ControllerPageState extends State<ControllerPage> {
   void _connectActiveCooler() {
     if (activeCooler == null) return;
     if (activeCooler!.mode == "WiFi") {
-      connectMQTT();
+      connectLocalWifi();
     } else {
       _connectBleById(activeCooler!.bleRemoteId);
     }
@@ -641,8 +641,8 @@ class _ControllerPageState extends State<ControllerPage> {
     if (activeCooler?.mode == "Bluetooth" && bleDevice != null) {
       bleDevice!.disconnect();
     }
-    if (activeCooler?.mode == "WiFi" && _mqttConnected) {
-      mqttClient?.disconnect();
+    if (activeCooler?.mode == "WiFi") {
+      _stopLocalWifi();
     }
     setState(() {
       activeCooler = cooler;
@@ -678,87 +678,155 @@ class _ControllerPageState extends State<ControllerPage> {
     _connectActiveCooler();
   }
 
-  // ===== MQTT =====
-  void connectMQTT() async {
+  // ===== WIFI LOKAL (tanpa broker/internet, langsung HTTP+UDP ke ESP32 di 1 jaringan) =====
+  void connectLocalWifi() async {
     if (activeCooler == null) {
       _showSnack("⚠️ Pilih atau tambah cooler dulu");
       return;
     }
-    // Client ID unik per-cooler per-sesi supaya tidak saling "menendang"
-    // koneksi kalau ada beberapa HP nyambung ke broker yang sama.
-    final clientId = 'flutter_${activeCooler!.id}_${DateTime.now().millisecondsSinceEpoch}';
-    mqttClient = MqttServerClient(broker, clientId);
-    mqttClient!.port = 1883;
-    mqttClient!.keepAlivePeriod = 20;
-    mqttClient!.onConnected = () {
-      setState(() => status = "🟢 Online");
-      mqttClient!.subscribe(statusTopic, MqttQos.atLeastOnce);
-    };
-    mqttClient!.onDisconnected = () {
+    // Coba IP terakhir yang diketahui dulu (kalau ada) sambil menunggu beacon baru masuk.
+    _wifiIp = activeCooler!.lastIp;
+    await _startUdpDiscovery();
+    _wifiPollTimer?.cancel();
+    _wifiPollTimer = Timer.periodic(Duration(seconds: 3), (_) => _pollWifiStatus());
+    _pollWifiStatus(); // langsung coba sekali, jangan tunggu 3 detik pertama
+  }
+
+  void _stopLocalWifi() {
+    _wifiPollTimer?.cancel();
+    _wifiPollTimer = null;
+    _udpDiscoverySocket?.close();
+    _udpDiscoverySocket = null;
+  }
+
+  // Dengarkan beacon UDP broadcast dari ESP32 ("saya di sini, IP saya x.x.x.x")
+  // supaya app tidak perlu tahu/isi IP manual walau IP-nya berubah-ubah (DHCP).
+  Future<void> _startUdpDiscovery() async {
+    try {
+      _udpDiscoverySocket?.close();
+      _udpDiscoverySocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, kUdpBeaconPort);
+      _udpDiscoverySocket!.broadcastEnabled = true;
+      _udpDiscoverySocket!.listen((event) {
+        if (event != RawSocketEvent.read) return;
+        final dg = _udpDiscoverySocket?.receive();
+        if (dg == null) return;
+        try {
+          final data = jsonDecode(utf8.decode(dg.data));
+          if (data['deviceId'] == activeCooler?.id && data['ip'] != null) {
+            final newIp = data['ip'] as String;
+            if (newIp != _wifiIp) {
+              _wifiIp = newIp;
+              activeCooler!.lastIp = newIp;
+              _savePairedCoolers();
+            }
+          }
+        } catch (e) {}
+      });
+    } catch (e) {
+      // Port kemungkinan sudah dipakai proses lain di HP -> discovery otomatis
+      // tidak jalan, tapi kontrol tetap bisa lewat IP terakhir yang tersimpan.
+    }
+  }
+
+  Future<void> _pollWifiStatus() async {
+    if (_wifiIp == null || activeCooler == null) {
+      if (mounted) setState(() => status = "🔴 Offline");
+      return;
+    }
+    try {
+      final response =
+          await http.get(Uri.http(_wifiIp!, "/status")).timeout(Duration(seconds: 3));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['deviceId'] != null && data['deviceId'] != activeCooler?.id) return;
+        setState(() {
+          status = "🟢 Online";
+          setVolt = (data['setVoltage'] ?? setVolt).toDouble();
+          ledMode = data['ledMode'] ?? ledMode;
+          uptime = data['uptime'] ?? "00:00:00";
+          if (ledMode != "off") lastLedEffect = ledMode;
+        });
+        if (activeCooler != null) {
+          HistoryService.recordStatus(coolerId: activeCooler!.id, online: true, voltage: setVolt);
+        }
+      } else {
+        setState(() => status = "🔴 Offline");
+      }
+    } catch (e) {
       setState(() => status = "🔴 Offline");
       if (activeCooler != null) {
         HistoryService.recordStatus(coolerId: activeCooler!.id, online: false, voltage: setVolt);
       }
-    };
-    mqttClient!.updates!.listen((msgs) {
-      final msg = msgs[0].payload as MqttPublishMessage;
-      final payload = MqttPublishPayload.bytesToStringAsString(msg.payload.message);
-      try {
-        var data = jsonDecode(payload);
-        // Jaga-jaga: pastikan status ini benar dari cooler yang sedang aktif,
-        // bukan nyasar dari cooler lain (mis. saat baru switch cooler).
-        if (data['deviceId'] != null && data['deviceId'] != activeCooler?.id) return;
-        setState(() {
-          setVolt = (data['setVoltage'] ?? setVolt).toDouble();
-          ledMode = data['ledMode'] ?? ledMode;
-          uptime = data['uptime'] ?? "00:00:00";
-          // Sinkronkan "efek terakhir" dari status device asli, supaya tombol
-          // "Nyala" tidak salah kirim efek lama setelah reconnect/restart app.
-          if (ledMode != "off") lastLedEffect = ledMode;
-        });
-        // Catat status ASLI ini ke riwayat pemakaian (data lokal di HP).
-        if (activeCooler != null) {
-          HistoryService.recordStatus(coolerId: activeCooler!.id, online: true, voltage: setVolt);
-        }
-      } catch (e) {}
-    });
+    }
+  }
+
+  bool get _wifiLocalConnected => activeCooler?.mode == "WiFi" && status == "🟢 Online";
+
+  void sendCommandLocalWifi(double volt) async {
+    if (_wifiIp == null) {
+      _showSnack("⚠️ Belum menemukan ESP32 di jaringan, tunggu sebentar / cek WiFi HP");
+      return;
+    }
     try {
-      await mqttClient!.connect();
+      await http
+          .get(Uri.http(_wifiIp!, "/set", {"voltage": volt.toString()}))
+          .timeout(Duration(seconds: 3));
+      setState(() => setVolt = volt);
     } catch (e) {
-      setState(() => status = "🔴 Offline");
+      _showSnack("⚠️ Gagal kirim perintah, cek koneksi WiFi");
     }
   }
 
-  bool get _mqttConnected =>
-      mqttClient != null &&
-      mqttClient!.connectionStatus!.state == MqttConnectionState.connected;
-
-  void sendCommandMQTT(double volt) async {
-    if (!_mqttConnected) {
-      setState(() => status = "🔴 Offline");
-      _showSnack("⚠️ Tidak terhubung ke broker MQTT");
+  void sendLedCommandLocalWifi(String mode) async {
+    if (_wifiIp == null) {
+      _showSnack("⚠️ Belum menemukan ESP32 di jaringan, tunggu sebentar / cek WiFi HP");
       return;
     }
-    var builder = MqttClientPayloadBuilder();
-    builder.addString(jsonEncode({"voltage": volt}));
-    mqttClient!.publishMessage(cmdTopic, MqttQos.atLeastOnce, builder.payload!);
-    setState(() {
-      setVolt = volt;
-    });
+    try {
+      await http.get(Uri.http(_wifiIp!, "/set", {"ledMode": mode})).timeout(Duration(seconds: 3));
+      setState(() => ledMode = mode);
+    } catch (e) {
+      _showSnack("⚠️ Gagal kirim perintah, cek koneksi WiFi");
+    }
   }
 
-  void sendLedCommandMQTT(String mode) async {
-    if (!_mqttConnected) {
-      setState(() => status = "🔴 Offline");
-      _showSnack("⚠️ Tidak terhubung ke broker MQTT");
+  // Pindahkan ESP32 yang sedang di mode WiFi kembali ke mode Bluetooth murni.
+  void switchToBleMode() async {
+    if (_wifiIp == null) {
+      _showSnack("⚠️ IP ESP32 belum diketahui, tunggu sebentar lalu coba lagi");
       return;
     }
-    var builder = MqttClientPayloadBuilder();
-    builder.addString(jsonEncode({"ledMode": mode}));
-    mqttClient!.publishMessage(cmdTopic, MqttQos.atLeastOnce, builder.payload!);
-    setState(() {
-      ledMode = mode;
-    });
+    try {
+      await http.get(Uri.http(_wifiIp!, "/switch_ble")).timeout(Duration(seconds: 3));
+      _showSnack("🔄 ESP32 sedang pindah ke mode Bluetooth...");
+      _stopLocalWifi();
+      setState(() {
+        if (activeCooler != null) activeCooler!.mode = "Bluetooth";
+        status = "🔴 Offline";
+      });
+      await _savePairedCoolers();
+      await Future.delayed(Duration(seconds: 5));
+      if (activeCooler?.bleRemoteId != null) {
+        _connectBleById(activeCooler!.bleRemoteId);
+      } else {
+        _showSnack("ℹ️ Scan Bluetooth ulang untuk sambung lagi (belum pernah dipasangkan lewat BLE)");
+      }
+    } catch (e) {
+      _showSnack("⚠️ Gagal kirim perintah pindah mode, cek koneksi WiFi");
+    }
+  }
+
+  // Suruh ESP32 (yang sedang di mode Bluetooth) menyalakan hotspot
+  // "ESP32-Config" supaya bisa disetel WiFi rumah lewat dialog yang sudah ada.
+  void switchToWifiSetup() async {
+    if (!bleConnected) {
+      _showSnack("⚠️ Sambungkan lewat Bluetooth dulu untuk setup WiFi");
+      return;
+    }
+    await sendBLERaw({"action": "start_wifi_setup"});
+    _showSnack("📶 Hotspot \"ESP32-Config\" sedang dinyalakan di ESP32...");
+    await Future.delayed(Duration(seconds: 2));
+    showWiFiSetupDialog();
   }
 
   // ===== BLUETOOTH =====
@@ -889,7 +957,7 @@ class _ControllerPageState extends State<ControllerPage> {
     }
     if (mode != "off") lastLedEffect = mode; // ingat efek terakhir buat tombol ON
     if (connectionMode == "WiFi") {
-      sendLedCommandMQTT(mode);
+      sendLedCommandLocalWifi(mode);
     } else {
       sendLedCommandBLE(mode);
     }
@@ -902,7 +970,7 @@ class _ControllerPageState extends State<ControllerPage> {
     }
     volt = double.parse(volt.toStringAsFixed(1));
     if (connectionMode == "WiFi") {
-      sendCommandMQTT(volt);
+      sendCommandLocalWifi(volt);
     } else {
       sendCommandBLE(volt);
     }
@@ -944,12 +1012,33 @@ class _ControllerPageState extends State<ControllerPage> {
       // langsung, jadi rusak kalau ssid/password ada spasi atau karakter
       // spesial seperti & + # %).
       var url = Uri.http("192.168.4.1", "/setwifi", {"ssid": ssid, "password": password});
-      var response = await http.get(url);
+      var response = await http.get(url).timeout(Duration(seconds: 8));
       if (response.statusCode == 200) {
+        String? newDeviceId;
+        try {
+          final data = jsonDecode(response.body);
+          newDeviceId = data['deviceId'] as String?;
+        } catch (e) {
+          // Firmware lama tanpa deviceId di respons -> tetap lanjut pakai activeCooler saat ini (kalau ada).
+        }
         _showSnack("✅ ESP32 berhasil terhubung ke $ssid");
         Navigator.pop(context);
+        // Cooler ini sekarang resmi jadi mode WiFi -> catat/​perbarui di daftar
+        // supaya lain kali app tahu harus connect lewat WiFi lokal, bukan BLE.
+        final id = newDeviceId ?? activeCooler?.id;
+        if (id != null) {
+          final existing = pairedCoolers.where((c) => c.id == id).toList();
+          if (existing.isNotEmpty) {
+            existing.first.mode = "WiFi";
+          } else {
+            addCooler(Cooler(id: id, nickname: "Cooler $id", mode: "WiFi"));
+            return; // addCooler() sudah otomatis _connectActiveCooler()
+          }
+          setState(() => activeCooler = existing.first);
+          await _savePairedCoolers();
+        }
         await Future.delayed(Duration(seconds: 5));
-        connectMQTT();
+        connectLocalWifi();
       } else {
         _showSnack("❌ Gagal terhubung, coba lagi");
       }
@@ -1082,8 +1171,8 @@ class _ControllerPageState extends State<ControllerPage> {
       if (activeCooler?.mode == "Bluetooth" && bleDevice != null) {
         bleDevice!.disconnect();
       }
-      if (activeCooler?.mode == "WiFi" && _mqttConnected) {
-        mqttClient?.disconnect();
+      if (activeCooler?.mode == "WiFi") {
+        _stopLocalWifi();
       }
 
       setState(() {
@@ -1119,10 +1208,8 @@ class _ControllerPageState extends State<ControllerPage> {
 
   void clearEsp32Cache() {
     if (connectionMode == "WiFi") {
-      if (_mqttConnected) {
-        var builder = MqttClientPayloadBuilder();
-        builder.addString(jsonEncode({"action": "clear_cache"}));
-        mqttClient!.publishMessage(cmdTopic, MqttQos.atLeastOnce, builder.payload!);
+      if (_wifiIp != null) {
+        http.get(Uri.http(_wifiIp!, "/set", {"action": "clear_cache"})).timeout(Duration(seconds: 3));
         _showSnack("🧹 Perintah bersihkan cache modul ESP32 terkirim");
       } else {
         _showSnack("⚠️ Tidak terhubung ke ESP32, cache tidak bisa dibersihkan");
@@ -1409,7 +1496,7 @@ class _ControllerPageState extends State<ControllerPage> {
   // ===== DIALOG: TAMBAH COOLER BARU =====
   // Dua cara: (1) scan Bluetooth lalu pilih unit fisik yang mau dipasangkan,
   // atau (2) masukkan manual ID cooler (dari layar Setup WiFi ESP32 / serial
-  // monitor) untuk dikontrol lewat WiFi/MQTT.
+  // monitor) untuk dikontrol lewat WiFi lokal (HTTP + UDP discovery).
   void showAddCoolerDialog() {
     final nicknameController = TextEditingController();
     final manualIdController = TextEditingController();
@@ -1653,11 +1740,28 @@ class _ControllerPageState extends State<ControllerPage> {
             ListTile(
               leading: Icon(Icons.settings_ethernet, color: AppColors.textFaint(isDark)),
               title: Text("Setup WiFi ESP32", style: TextStyle(color: AppColors.text(isDark))),
+              subtitle: bleConnected
+                  ? Text("Menyalakan hotspot ESP32-Config otomatis", style: TextStyle(color: AppColors.textFaint(isDark), fontSize: 10))
+                  : null,
               onTap: () {
                 Navigator.pop(context);
-                showWiFiSetupDialog();
+                if (bleConnected) {
+                  switchToWifiSetup();
+                } else {
+                  showWiFiSetupDialog();
+                }
               },
             ),
+            if (activeCooler?.mode == "WiFi")
+              ListTile(
+                leading: Icon(Icons.bluetooth_rounded, color: AppColors.textFaint(isDark)),
+                title: Text("Kembali ke Mode Bluetooth", style: TextStyle(color: AppColors.text(isDark))),
+                subtitle: Text("Matikan WiFi di ESP32, pakai Bluetooth lagi", style: TextStyle(color: AppColors.textFaint(isDark), fontSize: 10)),
+                onTap: () {
+                  Navigator.pop(context);
+                  switchToBleMode();
+                },
+              ),
             Divider(color: AppColors.divider(isDark)),
             _drawerSectionTitle("Data & Otomasi"),
             ListTile(
