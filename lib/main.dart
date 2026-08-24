@@ -958,6 +958,8 @@ class _ControllerPageState extends State<ControllerPage> {
     }
   }
 
+  OverlayEntry? _activeToastEntry;
+
   void _showSnack(String text) {
     if (!mounted) return;
     final isWarning = text.contains('⚠️');
@@ -977,11 +979,28 @@ class _ControllerPageState extends State<ControllerPage> {
             : isSuccess
                 ? Icons.check_circle_rounded
                 : Icons.info_rounded;
+    // Bersihkan emoji di depan teks (⚠️/❌/✅/🧹 dll) supaya tidak dobel dengan ikon toast.
+    final cleanText = text.replaceFirst(RegExp(r'^[^\w\s]+\s*'), '').trim();
+
+    // Kalau ada toast lain yang masih tampil, langsung lepas dulu (tanpa animasi)
+    // supaya toast baru tidak numpuk / terlihat "loncat" di atas toast lama.
+    _activeToastEntry?.remove();
+    _activeToastEntry = null;
+
     final overlay = Overlay.of(context);
     late final OverlayEntry entry;
     entry = OverlayEntry(
-      builder: (_) => _GamingToast(text: text, color: color, icon: icon, onDone: () => entry.remove()),
+      builder: (_) => _GamingToast(
+        text: cleanText,
+        color: color,
+        icon: icon,
+        onDone: () {
+          entry.remove();
+          if (_activeToastEntry == entry) _activeToastEntry = null;
+        },
+      ),
     );
+    _activeToastEntry = entry;
     overlay.insert(entry);
   }
 
@@ -1771,7 +1790,7 @@ class _ControllerPageState extends State<ControllerPage> {
             _drawerSectionTitle("Developer"),
             ListTile(
               leading: Icon(Icons.code_rounded, color: AppColors.textFaint(isDark)),
-              title: Text("NEXUS DEV", style: TextStyle(color: AppColors.text(isDark), fontWeight: FontWeight.w700)),
+              title: Text("VLADIMIR PUTIN", style: TextStyle(color: AppColors.text(isDark), fontWeight: FontWeight.w700)),
               subtitle: Text("Developer aplikasi & firmware", style: TextStyle(color: AppColors.textFaint(isDark), fontSize: 11)),
             ),
             ListTile(
@@ -1783,7 +1802,7 @@ class _ControllerPageState extends State<ControllerPage> {
             ),
             ListTile(
               leading: Icon(Icons.groups_rounded, color: AppColors.textFaint(isDark)),
-              title: Text("Group Developer", style: TextStyle(color: AppColors.text(isDark))),
+              title: Text("Group Community", style: TextStyle(color: AppColors.text(isDark))),
               subtitle: Text("t.me/forumdiskusitele", style: TextStyle(color: accentColor, fontSize: 11)),
               trailing: Icon(Icons.open_in_new_rounded, size: 16, color: AppColors.textFaint(isDark)),
               onTap: () => _openLink("https://t.me/forumdiskusitele"),
@@ -2293,9 +2312,9 @@ class _GamingToastState extends State<_GamingToast> with SingleTickerProviderSta
   late final Animation<Offset> _slide;
   late final Animation<double> _fade;
 
-  static const _inMs = 420;
-  static const _holdMs = 2000;
-  static const _outMs = 900;
+  static const _inMs = 450;
+  static const _holdMs = 1800;
+  static const _outMs = 1400;
 
   @override
   void initState() {
@@ -2308,7 +2327,7 @@ class _GamingToastState extends State<_GamingToast> with SingleTickerProviderSta
     _fade = TweenSequence<double>([
       TweenSequenceItem(tween: Tween(begin: 0.0, end: 1.0).chain(CurveTween(curve: Curves.easeOut)), weight: _inMs.toDouble()),
       TweenSequenceItem(tween: ConstantTween(1.0), weight: _holdMs.toDouble()),
-      TweenSequenceItem(tween: Tween(begin: 1.0, end: 0.0).chain(CurveTween(curve: Curves.easeInCubic)), weight: _outMs.toDouble()),
+      TweenSequenceItem(tween: Tween(begin: 1.0, end: 0.0).chain(CurveTween(curve: Curves.easeInOutCubic)), weight: _outMs.toDouble()),
     ]).animate(_ctrl);
     _ctrl.forward().whenComplete(() {
       if (mounted) widget.onDone();
