@@ -1,84 +1,81 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WiFiUdp.h>
 #include <Preferences.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
 #include <NimBLEDevice.h>
 #include <Adafruit_NeoPixel.h>
+#include <ArduinoJson.h>
 
-// ===================================================================
-// Board: ESP32-C3 Super Mini
-// Pin layout papan (kiri atas -> bawah): 5V, G, 3.3, 4, 3, 2, 1, 0
-// Pin layout papan (kanan atas -> bawah): 5, 6, 7, 8, 9, 10, 20, 21
-// GPIO 2, 8, 9 SENGAJA TIDAK DIPAKAI:
-//   - GPIO9 = tombol BOOT onboard (strapping pin, jangan dipakai)
-//   - GPIO8 = LED onboard
-//   - GPIO2 = strapping pin
-// ===================================================================
-
-// ===== KONFIGURASI =====
-// BLE menggunakan NimBLE (lebih ringan/stabil untuk ESP32-C3 dibanding legacy BLE).
-const char* ap_ssid = "ESP32Cooler";
-const char* ap_password = "bandar01";
-const char* mqtt_server = "broker.emqx.io";
-const int mqtt_port = 1883;
-
-// ===== ID UNIK PER PERANGKAT =====
-// Diambil dari MAC address chip (efuse), beda-beda otomatis di tiap unit ESP32.
-// Dipakai supaya BANYAK unit bisa jalan bareng tanpa tumbukan: tiap unit
-// punya nama Bluetooth sendiri dan "jalur" MQTT sendiri (bukan topic global).
-String deviceId;        // contoh: "A1B2C3"
-String bleName;          // contoh: "ESP32-Cooler-A1B2C3"
-String command_topic;    // contoh: "cooler/A1B2C3/command"
-String status_topic;     // contoh: "cooler/A1B2C3/status"
-String mqttClientId;     // contoh: "ESP32Cooler-A1B2C3" (biar tidak saling nendang di broker)
+String deviceId;
+String bleName;
 
 String computeDeviceId() {
   uint64_t mac = ESP.getEfuseMac();
   char buf[7];
-  // Ambil 3 byte terakhir dari MAC supaya pendek tapi tetap unik antar unit
   snprintf(buf, sizeof(buf), "%06X", (unsigned int)(mac & 0xFFFFFF));
   return String(buf);
 }
 
-// ===== PIN DECOY BOARD (PD3.1 QC3.0 Trigger, output "A") =====
-// Pad "1" di board decoy -> pilih 9V saat dihubungkan ke GND
-// Pad "2" di board decoy -> pilih 12V saat dihubungkan ke GND
-// Pad "3" di board decoy -> pilih 15V saat dihubungkan ke GND
-// Tidak ada pad yang disolder = default 5V (jangan sambungkan pad 4)
 #define PIN_SEL_9V  6
 #define PIN_SEL_12V 7
 #define PIN_SEL_15V 5
 
-// ===== LED STRIP WS2812B/SK6812 (3 kabel: hitam=GND, merah=5V, kuning=Data) =====
-// Beda dari LED auto-cycle sebelumnya: strip ini dikontrol digital per-LED,
-// jadi warna & efek "berjalan" dikerjakan ESP32 lewat library Adafruit NeoPixel.
-// Wiring: kuning (Data) -> GPIO4 (idealnya lewat resistor seri 330-470 ohm),
-// hitam (GND) -> GND yang sama dengan ESP32, merah (5V) -> sumber 5V terpisah
-// (JANGAN dari pin 5V ESP32 kalau LED banyak, arusnya bisa jauh lebih besar
-// dari yang sanggup disuplai ESP32).
 #define PIN_LED_DATA 4
-#define NUM_LEDS 30   // <-- GANTI sesuai JUMLAH LED ASLI di strip kamu (hitung manual)
+#define NUM_LEDS 30
 Adafruit_NeoPixel strip(NUM_LEDS, PIN_LED_DATA, NEO_GRB + NEO_KHZ800);
-String ledMode = "off"; // "off" | "static" | "running" | "disco" | "bounce"
-String lastLedEffect = "running"; // efek terakhir dipilih, dipakai saat tombol ON ditekan
+String ledMode = "off";
+String lastLedEffect = "running";
 unsigned long lastLedStep = 0;
 uint16_t rainbowStep = 0;
 int bouncePos = 0;
 int bounceDir = 1;
 
-Preferences preferences;
-WebServer server(80);
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+#define PIN_ONBOARD_LED 8
+#define ONBOARD_LED_ACTIVE_LOW true
+bool onboardBlinkActive = false;
+unsigned long onboardBlinkStart = 0;
+const unsigned long ONBOARD_BLINK_MS = 150;
+
+void onboardLedWrite(bool on) {
+  digitalWrite(PIN_ONBOARD_LED, (ONBOARD_LED_ACTIVE_LOW ? !on : on) ? LOW : HIGH);
+}
+
+void triggerOnboardBlink() {
+  onboardBlinkActive = true;
+  onboardBlinkStart = millis();
+  onboardLedWrite(true);
+}
+
+void handleOnboardBlink() {
+  if (onboardBlinkActive && millis() - onboardBlinkStart >= ONBOARD_BLINK_MS) {
+    onboardLedWrite(false);
+    onboardBlinkActive = false;
+  }
+}
 
 float currentSetVoltage = 5.0;
 unsigned long startMillis = 0;
 unsigned long lastPublish = 0;
 
-// ===== BLE =====
+Preferences prefs;
+String netMode;
+String savedSsid;
+String savedPass;
+bool wifiControlActive = false;
+bool configApActive = false;
+
+#define AP_SSID "ESP32-Config"
+#define AP_PASS "12345678"
+
+WebServer server(80);
+WiFiUDP udp;
+#define UDP_BEACON_PORT 47269
+unsigned long lastBeacon = 0;
+
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
 NimBLEServer* pServer = nullptr;
 NimBLECharacteristic* pCharacteristic = nullptr;
 volatile bool bleWritePending = false;
@@ -90,11 +87,13 @@ volatile uint16_t bleCommandLen = 0;
 class MyServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     deviceConnected = true;
+    Serial.println("BLE: Terhubung ke App!");
   }
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     deviceConnected = false;
-    pServer->startAdvertising();
+    Serial.println("BLE: Terputus, me-restart advertising...");
+    NimBLEDevice::getAdvertising()->start();
   }
 };
 
@@ -104,7 +103,6 @@ class MyCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     if (!value.empty()) {
       size_t n = value.size();
       if (n > sizeof(bleCommandBuf) - 1) n = sizeof(bleCommandBuf) - 1;
-
       portENTER_CRITICAL(&bleMux);
       memcpy(bleCommandBuf, value.data(), n);
       bleCommandBuf[n] = '\0';
@@ -115,17 +113,12 @@ class MyCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
-// ===== FUNGSI SET VOLTASE (khusus board decoy 1-pad-select) =====
-// Board ini BUKAN CH224K biner (CFG1/2/3 kombinasi). Board ini cuma
-// boleh 1 pad aktif (LOW) dalam satu waktu, sisanya HARUS floating.
 void applyVoltage(float volt) {
-  // Snap ke nilai terdekat yang benar-benar disupport hardware: 5 / 9 / 12 / 15
   if (volt >= 13.5) volt = 15.0;
   else if (volt >= 10.5) volt = 12.0;
   else if (volt >= 7.0) volt = 9.0;
   else volt = 5.0;
 
-  // Lepas semua pin dulu (floating = tidak menyolder pad apapun = default 5V)
   pinMode(PIN_SEL_9V, INPUT);
   pinMode(PIN_SEL_12V, INPUT);
   pinMode(PIN_SEL_15V, INPUT);
@@ -140,23 +133,22 @@ void applyVoltage(float volt) {
     pinMode(PIN_SEL_15V, OUTPUT);
     digitalWrite(PIN_SEL_15V, LOW);
   }
-  // volt == 5.0 -> ketiga pin dibiarkan floating (INPUT), tidak ada yang disolder
-
   currentSetVoltage = volt;
 }
 
-// ===== FUNGSI SET MODE LAMPU =====
-// "off"     -> matikan semua LED
-// "static"  -> gradient warna tetap, tidak bergerak (nyala diam)
-// "running" -> pelangi berjalan 1 arah
-// "disco"   -> warna acak berkedip cepat di semua LED
-// "bounce"  -> titik cahaya bolak-balik sepanjang strip
+uint32_t wheelColor(byte pos) {
+  pos = 255 - pos;
+  if (pos < 85) return strip.Color(255 - pos * 3, 0, pos * 3);
+  if (pos < 170) { pos -= 85; return strip.Color(0, pos * 3, 255 - pos * 3); }
+  pos -= 170;
+  return strip.Color(pos * 3, 255 - pos * 3, 0);
+}
+
 void applyLedMode(String mode) {
   if (mode != "off" && mode != "static" && mode != "running" &&
       mode != "disco" && mode != "bounce") return;
-
   ledMode = mode;
-  if (mode != "off") lastLedEffect = mode; // ingat efek terakhir buat tombol ON
+  if (mode != "off") lastLedEffect = mode;
 
   if (mode == "off") {
     strip.clear();
@@ -171,22 +163,11 @@ void applyLedMode(String mode) {
     bouncePos = 0;
     bounceDir = 1;
   }
-  // "running" & "disco" -> animasinya diproses tiap frame di handleLedAnimation()
 }
 
-// ===== FUNGSI BANTU: WARNA PELANGI DARI 1 ANGKA (0-255) =====
-uint32_t wheelColor(byte pos) {
-  pos = 255 - pos;
-  if (pos < 85) return strip.Color(255 - pos * 3, 0, pos * 3);
-  if (pos < 170) { pos -= 85; return strip.Color(0, pos * 3, 255 - pos * 3); }
-  pos -= 170;
-  return strip.Color(pos * 3, 255 - pos * 3, 0);
-}
-
-// ===== ANIMASI LAMPU (dipanggil terus-menerus di loop()) =====
 void handleLedAnimation() {
   if (ledMode == "running") {
-    if (millis() - lastLedStep < 20) return; // kecepatan animasi (ms/frame)
+    if (millis() - lastLedStep < 20) return;
     lastLedStep = millis();
     for (int i = 0; i < NUM_LEDS; i++) {
       int hue = ((i * 256 / NUM_LEDS) + rainbowStep) & 255;
@@ -195,20 +176,18 @@ void handleLedAnimation() {
     strip.show();
     rainbowStep += 3;
     if (rainbowStep >= 256) rainbowStep = 0;
-
   } else if (ledMode == "disco") {
-    if (millis() - lastLedStep < 120) return; // kecepatan kedip disko
+    if (millis() - lastLedStep < 120) return;
     lastLedStep = millis();
     for (int i = 0; i < NUM_LEDS; i++) {
       strip.setPixelColor(i, strip.Color(random(0, 256), random(0, 256), random(0, 256)));
     }
     strip.show();
-
   } else if (ledMode == "bounce") {
-    if (millis() - lastLedStep < 30) return; // kecepatan gerak titik
+    if (millis() - lastLedStep < 30) return;
     lastLedStep = millis();
     strip.clear();
-    const int tailLen = 4; // panjang ekor cahaya
+    const int tailLen = 4;
     for (int t = 0; t < tailLen; t++) {
       int pos = bouncePos - (bounceDir * t);
       if (pos >= 0 && pos < NUM_LEDS) {
@@ -224,219 +203,176 @@ void handleLedAnimation() {
     bouncePos += bounceDir;
     if (bouncePos >= NUM_LEDS - 1 || bouncePos <= 0) bounceDir = -bounceDir;
   }
-  // "static" & "off" -> tidak perlu update tiap frame, sudah digambar sekali di applyLedMode()
 }
 
-// ===== MQTT CALLBACK =====
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  StaticJsonDocument<128> doc;
-  if (deserializeJson(doc, msg)) return;
-  if (doc.containsKey("voltage")) applyVoltage(doc["voltage"]);
-  if (doc.containsKey("ledMode")) applyLedMode(String((const char*)doc["ledMode"]));
-  if (doc.containsKey("action") && String((const char*)doc["action"]) == "clear_cache") {
-    clearModuleCache();
-  }
-}
-
-// ===== BERSIHKAN "CACHE" MODUL =====
-// ESP32 tidak punya cache aplikasi seperti HP, jadi tombol ini mereset
-// state runtime yang tersimpan sementara di RAM: uptime dihitung ulang
-// dari 0 dan voltase dikembalikan ke default 5V. Kredensial WiFi yang
-// tersimpan di NVS (Preferences) TIDAK dihapus supaya ESP32 tidak
-// kehilangan koneksi WiFi rumah kamu.
-void clearModuleCache() {
-  applyVoltage(5.0);
-  startMillis = millis();
-  publishStatus();
-}
-
-// ===== REKONEKSI MQTT (non-blocking, tidak nge-freeze BLE/HTTP) =====
-unsigned long lastMqttAttempt = 0;
-void reconnectMQTTNonBlocking() {
-  if (mqttClient.connected()) return;
-  if (millis() - lastMqttAttempt < 5000) return;
-  lastMqttAttempt = millis();
-  if (mqttClient.connect(mqttClientId.c_str())) {
-    mqttClient.subscribe(command_topic.c_str());
-  }
-}
-
-// ===== PUBLISH STATUS =====
-void publishStatus() {
+String buildStatusJson() {
   unsigned long runtime = millis() - startMillis;
   long s = runtime / 1000, m = s / 60, h = m / 60;
   String uptime = String(h) + ":" + String(m % 60) + ":" + String(s % 60);
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["deviceId"] = deviceId;
   doc["setVoltage"] = currentSetVoltage;
   doc["ledMode"] = ledMode;
   doc["uptime"] = uptime;
   String jsonStr;
   serializeJson(doc, jsonStr);
+  return jsonStr;
+}
 
-  if (mqttClient.connected()) {
-    mqttClient.publish(status_topic.c_str(), jsonStr.c_str());
-  }
-  if (deviceConnected) {
-    if (pCharacteristic != nullptr) {
-      portENTER_CRITICAL(&bleMux);
-      bool connected = deviceConnected;
-      portEXIT_CRITICAL(&bleMux);
-
-      if (connected) {
-        pCharacteristic->setValue(jsonStr.c_str());
-        pCharacteristic->notify();
-      }
-    }
+void publishStatusBLE() {
+  if (deviceConnected && pCharacteristic != nullptr) {
+    String jsonStr = buildStatusJson();
+    pCharacteristic->setValue(jsonStr);
+    pCharacteristic->notify();
   }
 }
 
-// ===== API: SET WiFi =====
-void handleSetWiFi() {
-  if (server.hasArg("ssid") && server.hasArg("password")) {
-    String ssid = server.arg("ssid");
-    String pass = server.arg("password");
-    preferences.begin("wifi", false);
-    preferences.putString("ssid", ssid);
-    preferences.putString("pass", pass);
-    preferences.end();
-    server.send(200, "text/plain", "OK");
-    delay(1000);
-    ESP.restart();
-  } else {
-    server.send(400, "text/plain", "Missing ssid or password");
+void processCommandJson(const String& cmd) {
+  JsonDocument doc;
+  if (deserializeJson(doc, cmd)) return;
+  if (doc["voltage"].is<float>()) {
+    applyVoltage(doc["voltage"]);
+    triggerOnboardBlink();
   }
+  if (doc["ledMode"].is<const char*>()) applyLedMode(doc["ledMode"].as<String>());
 }
 
-// ===== HALAMAN KONFIGURASI WiFi =====
-void handleRootConfig() {
-  String html = "<html><head><meta name='viewport' content='width=device-width'><title>WiFi Setup</title>"
-                "<style>body{background:#0b0e14;color:#fff;font-family:sans-serif;text-align:center;padding:40px 20px;}"
-                "input,button{padding:14px;width:80%;margin:10px;border-radius:12px;border:none;font-size:16px;}"
-                "button{background:#00e5ff;color:#000;font-weight:bold;}</style></head>"
-                "<body><h2>⚙️ Set WiFi</h2><p style='opacity:.6;font-size:13px'>ID Perangkat: " + deviceId + "</p><form action='/setwifi' method='GET'>"
-                "<input name='ssid' placeholder='Nama WiFi' required><br>"
-                "<input name='password' type='password' placeholder='Password' required><br>"
-                "<button type='submit'>Simpan & Restart</button></form></body></html>";
-  server.send(200, "text/html", html);
-}
-
-// ===== API: Info perangkat (ID unik, dipakai app buat verifikasi) =====
-void handleDeviceInfo() {
-  StaticJsonDocument<128> doc;
-  doc["deviceId"] = deviceId;
-  doc["bleName"] = bleName;
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-  server.send(200, "application/json", jsonStr);
-}
-
-// ===== API: Scan WiFi =====
-// n == -2 -> scan belum pernah dimulai -> trigger scan, balas {"status":"scanning"}
-// n == -1 -> scan sedang berjalan (BUKAN error!) -> balas {"status":"scanning"} juga,
-//            biar app tahu harus coba lagi sebentar lagi, bukan berhenti dgn pesan error
-// n == 0  -> scan selesai, tidak ada jaringan ditemukan -> balas array kosong []
-// n > 0   -> scan selesai, ada hasil -> balas array hasil
-void handleScanWiFi() {
+void handleScanWifi() {
   int n = WiFi.scanComplete();
-  String json;
   if (n == -2) {
     WiFi.scanNetworks(true);
-    json = "{\"status\":\"scanning\"}";
-  } else if (n == -1) {
-    json = "{\"status\":\"scanning\"}";
-  } else {
-    json = "[";
-    for (int i = 0; i < n; ++i) {
-      if (i) json += ",";
-      json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
-    }
-    json += "]";
-    if (n > 0) WiFi.scanDelete();
+    server.send(200, "text/plain", "scanning");
+    return;
   }
-  server.send(200, "application/json", json);
+  if (n == -1) {
+    server.send(200, "text/plain", "scanning");
+    return;
+  }
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < n; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["ssid"] = WiFi.SSID(i);
+    o["rssi"] = WiFi.RSSI(i);
+  }
+  String out;
+  serializeJson(doc, out);
+  WiFi.scanDelete();
+  server.send(200, "application/json", out);
 }
 
-// ===== API: SET VOLTAGE via HTTP (fallback saat AP mode) =====
-void handleSetVoltageHttp() {
-  if (server.hasArg("voltage")) {
-    applyVoltage(server.arg("voltage").toFloat());
-    server.send(200, "application/json", "{\"status\":\"ok\",\"setVoltage\":" + String(currentSetVoltage) + "}");
-  } else {
-    server.send(400, "text/plain", "Missing voltage");
+void handleSetWifi() {
+  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+    server.send(400, "text/plain", "missing ssid/password");
+    return;
   }
-}
-
-// ===== API: SET MODE LAMPU via HTTP (fallback saat AP mode) =====
-void handleSetLedHttp() {
-  if (server.hasArg("mode")) {
-    applyLedMode(server.arg("mode"));
-    server.send(200, "application/json", "{\"status\":\"ok\",\"ledMode\":\"" + ledMode + "\"}");
-  } else {
-    server.send(400, "text/plain", "Missing mode");
-  }
-}
-
-// ===== API: STATUS / SAFE =====
-void handleStatusHttp() {
-  StaticJsonDocument<256> doc;
+  String ssid = server.arg("ssid");
+  String pass = server.arg("password");
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.putString("netMode", "wifi");
+  JsonDocument doc;
+  doc["result"] = "OK";
   doc["deviceId"] = deviceId;
-  doc["setVoltage"] = currentSetVoltage;
-  doc["ledMode"] = ledMode;
-  doc["uptime"] = String((millis() - startMillis) / 1000);
-  doc["wifi"] = WiFi.status() == WL_CONNECTED;
-  doc["ble"] = deviceConnected;
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-  server.send(200, "application/json", jsonStr);
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+  Serial.println("Kredensial WiFi disimpan (" + ssid + "), restart untuk masuk mode WiFi...");
+  delay(400);
+  ESP.restart();
 }
 
-// SAFE = kembali ke default 5V. Hardware ini tidak memiliki jalur OFF
-// terpisah, jadi endpoint ini sengaja tidak mengklaim bahwa output mati.
-void handleSafeHttp() {
-  applyVoltage(5.0);
-  server.send(200, "application/json", "{\"status\":\"ok\",\"setVoltage\":5}");
+void handleStatusHttp() {
+  server.send(200, "application/json", buildStatusJson());
 }
 
-// ===== SETUP =====
-void setup() {
-  Serial.begin(115200);
-  randomSeed(esp_random());
+void handleSetCmd() {
+  JsonDocument doc;
+  if (server.hasArg("voltage")) doc["voltage"] = server.arg("voltage").toFloat();
+  if (server.hasArg("ledMode")) doc["ledMode"] = server.arg("ledMode");
+  if (server.hasArg("action")) doc["action"] = server.arg("action");
+  String cmd;
+  serializeJson(doc, cmd);
+  processCommandJson(cmd);
+  server.send(200, "text/plain", "OK");
+}
 
-  // ===== HITUNG ID UNIK PERANGKAT (WAJIB paling awal, dipakai di semua tempat) =====
-  deviceId = computeDeviceId();
-  bleName = "ESP32-Cooler-" + deviceId;
-  command_topic = "cooler/" + deviceId + "/command";
-  status_topic = "cooler/" + deviceId + "/status";
-  mqttClientId = "ESP32Cooler-" + deviceId;
-  Serial.println("=== ID Perangkat: " + deviceId + " ===");
-  Serial.println("BLE name: " + bleName);
-  Serial.println("MQTT command topic: " + command_topic);
+void handleSwitchBle() {
+  server.send(200, "text/plain", "OK");
+  prefs.putString("netMode", "ble");
+  Serial.println("Pindah ke mode Bluetooth, restart...");
+  delay(400);
+  ESP.restart();
+}
 
-  // Voltage select pins: default floating (5V), belum ada yang disolder ke GND
-  applyVoltage(5.0);
+void registerHttpHandlers() {
+  server.on("/scanwifi", handleScanWifi);
+  server.on("/setwifi", handleSetWifi);
+  server.on("/status", handleStatusHttp);
+  server.on("/set", handleSetCmd);
+  server.on("/switch_ble", handleSwitchBle);
+}
 
-  // Lampu: mulai strip, batasi brightness biar arus aman, lalu matikan dulu
-  strip.begin();
-  strip.setBrightness(80); // 0-255; makin tinggi makin terang TAPI makin besar arusnya
-  strip.show();
-  applyLedMode("off");
+void startConfigAP() {
+  if (configApActive) return;
 
-  // ===== BACA WIFI TERSIMPAN =====
-  preferences.begin("wifi", false);
-  String savedSSID = preferences.getString("ssid", "");
-  String savedPass = preferences.getString("pass", "");
-  preferences.end();
+  WiFi.mode(wifiControlActive ? WIFI_AP_STA : WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  server.begin();
+  configApActive = true;
+  Serial.println("Config AP aktif: " + String(AP_SSID) + " @ " + WiFi.softAPIP().toString());
+}
 
-  // ===== START BLE =====
+void sendUdpBeacon() {
+  JsonDocument doc;
+  doc["deviceId"] = deviceId;
+  doc["ip"] = WiFi.localIP().toString();
+  String out;
+  serializeJson(doc, out);
+  udp.beginPacket(IPAddress(255, 255, 255, 255), UDP_BEACON_PORT);
+  udp.write((const uint8_t*)out.c_str(), out.length());
+  udp.endPacket();
+}
+
+void startWifiControlMode(const String& ssid, const String& pass) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  Serial.println("Menghubungkan ke WiFi: " + ssid);
+  unsigned long attemptStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - attemptStart < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nSUKSES: WiFi tersambung, IP: " + WiFi.localIP().toString());
+    server.begin();
+    udp.begin(UDP_BEACON_PORT);
+    wifiControlActive = true;
+  } else {
+    Serial.println("\nGAGAL: Tidak bisa konek WiFi dalam 15 detik, kembali ke mode Bluetooth...");
+    prefs.putString("netMode", "ble");
+    delay(300);
+    ESP.restart();
+  }
+}
+
+void startBleMode() {
+  Serial.println("Menginisialisasi Bluetooth (NimBLE)...");
+
   NimBLEDevice::init(bleName.c_str());
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  #ifdef ESP_PWR_LVL_P9
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  #else
+    NimBLEDevice::setPower(9);
+  #endif
+
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
+
   NimBLEService *pService = pServer->createService(SERVICE_UUID);
+
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
     NIMBLE_PROPERTY::READ |
@@ -445,54 +381,68 @@ void setup() {
   );
   pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
   pService->start();
-  pServer->startAdvertising();
-  Serial.println("BLE siap!");
 
-  // ===== HTTP endpoints (dipakai baik di AP mode maupun WiFi mode) =====
-  server.on("/", handleRootConfig);
-  server.on("/setwifi", handleSetWiFi);
-  server.on("/scanwifi", handleScanWiFi);
-  server.on("/api/set", handleSetVoltageHttp);
-  server.on("/api/led", handleSetLedHttp);
-  server.on("/api/info", handleDeviceInfo);
-  server.on("/api/status", handleStatusHttp);
-  server.on("/api/safe", handleSafeHttp);
-  server.begin();
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setAppearance(0x0000);
 
-  // ===== COBA KONEK WIFI =====
-  if (savedSSID != "") {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
-      delay(500);
-      Serial.print(".");
-      tries++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nWiFi terhubung! IP: " + WiFi.localIP().toString());
-      mqttClient.setServer(mqtt_server, mqtt_port);
-      mqttClient.setCallback(mqttCallback);
-      startMillis = millis();
-      return;
+  NimBLEAdvertisementData scanResponseData;
+  scanResponseData.setName(bleName.c_str());
+  pAdvertising->setScanResponseData(scanResponseData);
+  pAdvertising->enableScanResponse(true);
+
+  bool advSuccess = pAdvertising->start();
+  if (advSuccess) {
+    Serial.println("SUKSES: BLE Advertising aktif dengan nama: " + bleName);
+  } else {
+    Serial.println("GAGAL: BLE Advertising gagal dimulai!");
+  }
+}
+
+void handleBleAction(const String& action) {
+  if (action == "start_wifi_setup") {
+    startConfigAP();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  deviceId = computeDeviceId();
+  bleName = "ESP32-Cooler-" + deviceId;
+
+  pinMode(PIN_ONBOARD_LED, OUTPUT);
+  onboardLedWrite(false);
+
+  applyVoltage(5.0);
+  strip.begin();
+  strip.setBrightness(80);
+  strip.show();
+  applyLedMode("off");
+
+  prefs.begin("cooler", false);
+  netMode = prefs.getString("netMode", "ble");
+  savedSsid = prefs.getString("ssid", "");
+  savedPass = prefs.getString("pass", "");
+
+  registerHttpHandlers();
+
+  if (netMode == "wifi" && savedSsid.length() > 0) {
+    startWifiControlMode(savedSsid, savedPass);
+  } else {
+    startBleMode();
+    if (savedSsid.length() == 0) {
+      startConfigAP();
+    } else {
+      WiFi.mode(WIFI_OFF);
     }
   }
 
-  // ===== JIKA GAGAL -> AP MODE =====
-  // PENTING: pakai WIFI_AP_STA (bukan WIFI_AP murni). Radio STA wajib aktif
-  // supaya WiFi.scanNetworks() di handleScanWiFi() bisa jalan. Kalau cuma
-  // WIFI_AP, scan WiFi sekitar akan selalu gagal/timeout (dikonfirmasi di
-  // banyak laporan ESP32/ESP-IDF: scanning butuh interface STA aktif).
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(ap_ssid, ap_password);
-  Serial.println("AP Mode aktif: " + String(ap_ssid) + " IP: 192.168.4.1");
   startMillis = millis();
 }
 
 void loop() {
-  // ===== Proses Perintah BLE =====
-  // Ambil command BLE secara atomik agar callback BLE tidak menulis String
-  // bersamaan dengan loop() (menghindari race/corruption).
   char cmdBuf[129] = {0};
   portENTER_CRITICAL(&bleMux);
   if (bleWritePending) {
@@ -506,32 +456,30 @@ void loop() {
   String cmd = String(cmdBuf);
 
   if (cmd.length() > 0) {
-    StaticJsonDocument<128> doc;
-    if (!deserializeJson(doc, cmd)) {
-      if (doc.containsKey("voltage")) applyVoltage(doc["voltage"]);
-      if (doc.containsKey("ledMode")) applyLedMode(String((const char*)doc["ledMode"]));
-      if (doc.containsKey("action") && String((const char*)doc["action"]) == "clear_cache") {
-        clearModuleCache();
-      }
+    processCommandJson(cmd);
+
+    JsonDocument doc;
+    if (!deserializeJson(doc, cmd) && doc["action"].is<const char*>()) {
+      handleBleAction(doc["action"].as<String>());
     }
   }
 
-  server.handleClient();
-
-  // ===== Jalankan 1 frame animasi lampu (kalau mode running/disco/bounce) =====
-  handleLedAnimation();
-
-  // ===== Mode WiFi: MQTT =====
-  if (WiFi.status() == WL_CONNECTED) {
-    reconnectMQTTNonBlocking();
-    mqttClient.loop();
+  if (configApActive || wifiControlActive) {
+    server.handleClient();
   }
 
-  // ===== Publish status berkala (WiFi & BLE) =====
+  if (wifiControlActive && millis() - lastBeacon > 2000) {
+    sendUdpBeacon();
+    lastBeacon = millis();
+  }
+
+  handleOnboardBlink();
+  handleLedAnimation();
+
   if (millis() - lastPublish > 3000) {
-    publishStatus();
+    publishStatusBLE();
     lastPublish = millis();
   }
 
-  delay(10);
+  delay(5);
 }
